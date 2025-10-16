@@ -8,7 +8,6 @@ CREATE TABLE DBA.dbo.ServerLoginAuditLog (
     AppName NVARCHAR(128),
     EventDate DATETIME DEFAULT GETDATE()
 );
-
 -- Database-level audit log
 CREATE TABLE DBA.dbo.DatabaseUserAuditLog (
     EventType NVARCHAR(100),
@@ -189,3 +188,4 @@ EXEC msdb.dbo.sp_send_dbmail
     @subject = 'Daily SQL Audit Report',
     @body = @html,
     @body_format = 'HTML';
+
