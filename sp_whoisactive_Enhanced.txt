@@ -1,4 +1,4 @@
----Here's your modified script using **Option 4** with an enhanced custom wrapper that captures procedure names:
+
 
 ---- Modified Script with Procedure Name Extraction
 
@@ -442,5 +442,6 @@ ORDER BY avg_duration_sec DESC;
 --4. **Historical analysis** - Track performance over time
 --5. **Plan comparison** - Identify when plans changed
 --6. **Wait analysis** - See what procedures are waiting on
+
 
 --This solution gives you immediate answers to "which stored procedure had issues and when did it start?"
