@@ -1,0 +1,446 @@
+---Here's your modified script using **Option 4** with an enhanced custom wrapper that captures procedure names:
+
+---- Modified Script with Procedure Name Extraction
+
+
+SET NOCOUNT ON;
+
+DECLARE
+    @retention INT = 7,
+    @destination_table VARCHAR(500) = 'WhoIsActive',
+    @destination_database SYSNAME = 'DBA',
+    @schema VARCHAR(MAX),
+    @ NVARCHAR(4000),
+    @parameters NVARCHAR(500),
+    @exists BIT;
+
+SET @destination_table = @destination_database + '.dbo.' + @destination_table;
+
+-- *******************************************************************
+-- CREATE THE LOGGING TABLE IF IT DOESN'T EXIST (WITH ENHANCED COLUMNS)
+-- *******************************************************************
+IF OBJECT_ID(@destination_table) IS NULL
+BEGIN
+    EXEC sp_WhoIsActive  
+        @get_transaction_info = 1,  
+        @get_outer_command = 1,  
+        @get_plans = 1,  
+        @return_schema = 1,  
+        @schema = @schema OUTPUT;
+    
+    SET @schema = REPLACE(@schema, '<table_name>', @destination_table);
+    EXEC(@schema);
+    
+    -- Add custom columns for procedure tracking
+    SET @ = '
+    ALTER TABLE ' + @destination_table + ' 
+    ADD 
+        procedure_name NVARCHAR(256) NULL,
+        object_id INT NULL,
+        object_database NVARCHAR(128) NULL;';
+    EXEC(@);
+END;
+
+-- Ensure custom columns exist (for existing tables)
+IF NOT EXISTS (
+    SELECT 1 
+    FROM sys.columns 
+    WHERE object_id = OBJECT_ID(@destination_table) 
+    AND name = 'procedure_name'
+)
+BEGIN
+    SET @ = '
+    ALTER TABLE ' + @destination_table + ' 
+    ADD 
+        procedure_name NVARCHAR(256) NULL,
+        object_id INT NULL,
+        object_database NVARCHAR(128) NULL;';
+    EXEC(@);
+END;
+
+-- CREATE CLUSTERED INDEX ON COLLECTION TIME
+SET @ = 'USE ' + QUOTENAME(@destination_database) + '; 
+IF NOT EXISTS (
+    SELECT * FROM sys.indexes 
+    WHERE object_id = OBJECT_ID(@destination_table) 
+    AND name = N''cx_collection_time''
+) 
+SET @exists = 0';
+
+SET @parameters = N'@destination_table VARCHAR(500), @exists BIT OUTPUT';
+EXEC sp_execute @, @parameters, 
+    @destination_table = @destination_table, 
+    @exists = @exists OUTPUT;
+
+IF @exists = 0
+BEGIN
+    SET @ = 'CREATE CLUSTERED INDEX cx_collection_time ON ' + 
+        @destination_table + '(collection_time ASC)';
+    EXEC (@);
+END;
+
+-- CREATE INDEX ON PROCEDURE NAME (NEW)
+SET @ = 'USE ' + QUOTENAME(@destination_database) + '; 
+IF NOT EXISTS (
+    SELECT * FROM sys.indexes 
+    WHERE object_id = OBJECT_ID(@destination_table) 
+    AND name = N''ix_procedure_name''
+) 
+SET @exists = 0';
+
+EXEC sp_execute @, @parameters, 
+    @destination_table = @destination_table, 
+    @exists = @exists OUTPUT;
+
+IF @exists = 0
+BEGIN
+    SET @ = 'CREATE NONCLUSTERED INDEX ix_procedure_name ON ' + 
+        @destination_table + '(procedure_name, collection_time) ' +
+        'INCLUDE (session_id, reads, CPU, start_time) ' +
+        'WHERE procedure_name IS NOT NULL';
+    EXEC (@);
+END;
+
+-- ************************************************************
+-- COLLECT ACTIVITY INTO TEMP TABLE FIRST
+-- ************************************************************
+IF OBJECT_ID('tempdb..#WhoIsActive_Temp') IS NOT NULL
+    DROP TABLE #WhoIsActive_Temp;
+
+CREATE TABLE #WhoIsActive_Temp (
+    [dd hh:mm:ss.mss] VARCHAR(20) NULL,
+    [session_id] SMALLINT NOT NULL,
+    [_text] XML NULL,
+    [_command] XML NULL,
+    [login_name] NVARCHAR(128) NOT NULL,
+    [wait_info] NVARCHAR(4000) NULL,
+    [tran_log_writes] NVARCHAR(50) NULL,
+    [CPU] VARCHAR(30) NULL,
+    [tempdb_allocations] VARCHAR(30) NULL,
+    [tempdb_current] VARCHAR(30) NULL,
+    [blocking_session_id] SMALLINT NULL,
+    [reads] VARCHAR(30) NULL,
+    [writes] VARCHAR(30) NULL,
+    [physical_reads] VARCHAR(30) NULL,
+    [query_plan] XML NULL,
+    [used_memory] VARCHAR(30) NULL,
+    [status] VARCHAR(30) NOT NULL,
+    [tran_start_time] DATETIME NULL,
+    [open_tran_count] VARCHAR(30) NULL,
+    [percent_complete] VARCHAR(30) NULL,
+    [host_name] NVARCHAR(128) NULL,
+    [database_name] NVARCHAR(128) NULL,
+    [program_name] NVARCHAR(128) NULL,
+    [start_time] DATETIME NOT NULL,
+    [login_time] DATETIME NULL,
+    [request_id] INT NULL,
+    [collection_time] DATETIME NOT NULL,
+    [procedure_name] NVARCHAR(256) NULL,
+    [object_id] INT NULL,
+    [object_database] NVARCHAR(128) NULL
+);
+
+-- Collect data into temp table
+INSERT INTO #WhoIsActive_Temp
+EXEC sp_WhoIsActive 
+    @get_transaction_info = 1,  
+    @get_outer_command = 1,  
+    @get_plans = 1;
+
+-- Update collection_time
+UPDATE #WhoIsActive_Temp 
+SET collection_time = GETDATE() 
+WHERE collection_time IS NULL;
+
+-- ************************************************************
+-- EXTRACT PROCEDURE NAMES AND ENRICH DATA
+-- ************************************************************
+UPDATE t
+SET 
+    procedure_name = CASE
+        -- Handle EXEC [schema].[procname] or EXEC [procname]
+        WHEN _cmd LIKE '%EXEC [[]%].[[]%]%' OR _cmd LIKE '%EXECUTE [[]%].[[]%]%'
+        THEN LTRIM(RTRIM(
+            SUBSTRING(
+                _cmd,
+                PATINDEX('%EXEC%[[]%', _cmd) + PATINDEX('%[[]%', SUBSTRING(_cmd, PATINDEX('%EXEC%', _cmd), 1000)),
+                CHARINDEX(']', _cmd, PATINDEX('%EXEC%[[]%', _cmd) + PATINDEX('%[[]%', SUBSTRING(_cmd, PATINDEX('%EXEC%', _cmd), 1000)) + 1) - 
+                (PATINDEX('%EXEC%[[]%', _cmd) + PATINDEX('%[[]%', SUBSTRING(_cmd, PATINDEX('%EXEC%', _cmd), 1000))) + 1
+            )
+        ))
+        -- Handle EXEC schema.procname or EXEC procname
+        WHEN _cmd LIKE '%EXEC %' OR _cmd LIKE '%EXECUTE %'
+        THEN LTRIM(RTRIM(
+            CASE 
+                WHEN CHARINDEX(' ', _cmd, PATINDEX('%EXEC%', _cmd) + 5) > 0
+                THEN SUBSTRING(
+                    _cmd,
+                    PATINDEX('%EXEC%', _cmd) + 5,
+                    CHARINDEX(' ', _cmd, PATINDEX('%EXEC%', _cmd) + 5) - PATINDEX('%EXEC%', _cmd) - 5
+                )
+                WHEN CHARINDEX(CHAR(13), _cmd, PATINDEX('%EXEC%', _cmd) + 5) > 0
+                THEN SUBSTRING(
+                    _cmd,
+                    PATINDEX('%EXEC%', _cmd) + 5,
+                    CHARINDEX(CHAR(13), _cmd, PATINDEX('%EXEC%', _cmd) + 5) - PATINDEX('%EXEC%', _cmd) - 5
+                )
+                ELSE SUBSTRING(_cmd, PATINDEX('%EXEC%', _cmd) + 5, 100)
+            END
+        ))
+        -- Handle direct procedure execution (from jobs, etc.)
+        WHEN _cmd NOT LIKE '%SELECT%' 
+            AND _cmd NOT LIKE '%INSERT%' 
+            AND _cmd NOT LIKE '%UPDATE%' 
+            AND _cmd NOT LIKE '%DELETE%'
+            AND PATINDEX('%[a-z]%', _cmd) > 0
+        THEN LTRIM(RTRIM(
+            SUBSTRING(
+                _cmd,
+                PATINDEX('%[a-z]%', _cmd),
+                COALESCE(
+                    NULLIF(CHARINDEX(' ', _cmd, PATINDEX('%[a-z]%', _cmd)), 0),
+                    NULLIF(CHARINDEX(CHAR(13), _cmd, PATINDEX('%[a-z]%', _cmd)), 0),
+                    100
+                ) - PATINDEX('%[a-z]%', _cmd)
+            )
+        ))
+        ELSE NULL
+    END,
+    object_database = t.database_name
+FROM #WhoIsActive_Temp t
+CROSS APPLY (
+    SELECT CAST(COALESCE(t._command, t._text) AS NVARCHAR(MAX)) AS _cmd
+) ca
+WHERE CAST(COALESCE(t._command, t._text) AS NVARCHAR(MAX)) IS NOT NULL;
+
+-- Clean up procedure names (remove brackets, parameters, etc.)
+UPDATE #WhoIsActive_Temp
+SET procedure_name = REPLACE(REPLACE(REPLACE(
+    CASE 
+        WHEN CHARINDEX('(', procedure_name) > 0 
+        THEN LEFT(procedure_name, CHARINDEX('(', procedure_name) - 1)
+        WHEN CHARINDEX(';', procedure_name) > 0 
+        THEN LEFT(procedure_name, CHARINDEX(';', procedure_name) - 1)
+        ELSE procedure_name
+    END, '[', ''), ']', ''), CHAR(13), '')
+WHERE procedure_name IS NOT NULL;
+
+-- Try to get object_id for stored procedures
+UPDATE t
+SET object_id = OBJECT_ID(
+    CASE 
+        WHEN t.procedure_name LIKE '%.%.%' THEN t.procedure_name
+        WHEN t.procedure_name LIKE '%.%' THEN QUOTENAME(t.object_database) + '.' + t.procedure_name
+        ELSE QUOTENAME(t.object_database) + '.dbo.' + t.procedure_name
+    END
+)
+FROM #WhoIsActive_Temp t
+WHERE t.procedure_name IS NOT NULL
+    AND t.object_database IS NOT NULL;
+
+-- ************************************************************
+-- INSERT ENRICHED DATA INTO PERMANENT TABLE
+-- ************************************************************
+SET @ = '
+INSERT INTO ' + @destination_table + '
+SELECT * FROM #WhoIsActive_Temp';
+
+EXEC (@);
+
+DROP TABLE #WhoIsActive_Temp;
+
+-- ************************************************************
+-- PURGE OLD DATA
+-- ************************************************************
+SET @ = '
+DELETE FROM ' + @destination_table + ' 
+WHERE collection_time < DATEADD(day, -' + CAST(@retention AS VARCHAR(10)) + ', GETDATE());';
+
+EXEC (@);
+
+-- ************************************************************
+-- OPTIONAL: LOG STATISTICS
+-- ************************************************************
+SET @ = '
+SELECT 
+    GETDATE() AS log_time,
+    COUNT(*) AS rows_collected,
+    COUNT(DISTINCT procedure_name) AS distinct_procedures,
+    COUNT(CASE WHEN procedure_name IS NOT NULL THEN 1 END) AS procedures_captured
+FROM ' + @destination_table + '
+WHERE collection_time >= DATEADD(MINUTE, -2, GETDATE())';
+
+-- Uncomment to see collection stats
+-- EXEC (@);
+
+
+---
+
+---- Enhanced Query Scripts for Analysis
+
+Now that you have procedure names captured, use these queries:
+
+----# 1. **Find Performance Issues by Procedure**
+
+
+USE DBA;
+GO
+
+-- Performance summary by procedure
+SELECT 
+    procedure_name,
+    COUNT(*) AS execution_count,
+    AVG(DATEDIFF(SECOND, start_time, collection_time)) AS avg_duration_sec,
+    MAX(DATEDIFF(SECOND, start_time, collection_time)) AS max_duration_sec,
+    AVG(CAST(reads AS BIGINT)) AS avg_reads,
+    MAX(CAST(reads AS BIGINT)) AS max_reads,
+    AVG(CAST(CPU AS BIGINT)) AS avg_cpu,
+    MIN(collection_time) AS first_seen,
+    MAX(collection_time) AS last_seen
+FROM dbo.WhoIsActive
+WHERE procedure_name IS NOT NULL
+    AND collection_time >= DATEADD(DAY, -7, GETDATE())
+GROUP BY procedure_name
+ORDER BY avg_duration_sec DESC;
+
+
+----# 2. **Detect When a Procedure Started Having Issues**
+
+
+-- Time series analysis for a specific procedure
+DECLARE @ProcName NVARCHAR(256) = 'YourStoredProcName';
+
+SELECT 
+    CAST(collection_time AS DATE) AS execution_date,
+    DATEPART(HOUR, collection_time) AS execution_hour,
+    COUNT(*) AS execution_count,
+    AVG(DATEDIFF(SECOND, start_time, collection_time)) AS avg_duration_sec,
+    MAX(DATEDIFF(SECOND, start_time, collection_time)) AS max_duration_sec,
+    AVG(CAST(reads AS BIGINT)) AS avg_reads,
+    MAX(CAST(reads AS BIGINT)) AS max_reads,
+    STRING_AGG(DISTINCT wait_info, '; ') AS common_waits
+FROM dbo.WhoIsActive
+WHERE procedure_name = @ProcName
+GROUP BY CAST(collection_time AS DATE), DATEPART(HOUR, collection_time)
+ORDER BY execution_date DESC, execution_hour DESC;
+
+
+----# 3. **Identify Plan Changes**
+
+
+-- Find different query plans for the same procedure
+DECLARE @ProcName NVARCHAR(256) = 'YourStoredProcName';
+
+SELECT 
+    procedure_name,
+    query_plan.value('declare namespace p="http://schemas.microsoft.com/server/2004/07/showplan";
+                      (//p:StmtSimple/@QueryHash)[1]', 'VARCHAR(100)') AS QueryHash,
+    query_plan.value('declare namespace p="http://schemas.microsoft.com/server/2004/07/showplan";
+                      (//p:StmtSimple/@QueryPlanHash)[1]', 'VARCHAR(100)') AS QueryPlanHash,
+    MIN(collection_time) AS first_seen,
+    MAX(collection_time) AS last_seen,
+    COUNT(*) AS times_seen,
+    AVG(DATEDIFF(SECOND, start_time, collection_time)) AS avg_duration_sec,
+    AVG(CAST(reads AS BIGINT)) AS avg_reads
+FROM dbo.WhoIsActive
+WHERE procedure_name = @ProcName
+    AND query_plan IS NOT NULL
+GROUP BY 
+    procedure_name,
+    query_plan.value('declare namespace p="http://schemas.microsoft.com/server/2004/07/showplan";
+                      (//p:StmtSimple/@QueryHash)[1]', 'VARCHAR(100)'),
+    query_plan.value('declare namespace p="http://schemas.microsoft.com/server/2004/07/showplan";
+                      (//p:StmtSimple/@QueryPlanHash)[1]', 'VARCHAR(100)')
+ORDER BY first_seen DESC;
+
+
+----# 4. **Complete Forensic Timeline**
+
+
+-- Complete timeline for troubleshooting
+DECLARE @ProcName NVARCHAR(256) = 'YourStoredProcName';
+DECLARE @ProblemTime DATETIME2 = '2025-10-14 10:30:00';
+DECLARE @TimeWindow INT = 60; -- minutes
+
+WITH Timeline AS (
+    -- WhoIsActive captures
+    SELECT 
+        collection_time AS event_time,
+        'Execution Captured' AS event_type,
+        CONCAT(
+            'Session: ', session_id,
+            ', Duration: ', DATEDIFF(SECOND, start_time, collection_time), 's',
+            ', Reads: ', reads,
+            ', Waits: ', COALESCE(wait_info, 'None')
+        ) AS event_detail,
+        CAST(reads AS BIGINT) AS metric_value,
+        query_plan
+    FROM dbo.WhoIsActive
+    WHERE procedure_name = @ProcName
+        AND collection_time BETWEEN 
+            DATEADD(MINUTE, -@TimeWindow, @ProblemTime) AND 
+            DATEADD(MINUTE, @TimeWindow, @ProblemTime)
+    
+    UNION ALL
+    
+    -- Query Store plan changes
+    SELECT 
+        rs.first_execution_time,
+        'New Plan Detected',
+        CONCAT('Plan ID: ', p.plan_id, ', Avg Duration: ', rs.avg_duration/1000.0, 'ms'),
+        rs.avg_duration,
+        p.query_plan
+    FROM sys.query_store_query q
+    JOIN sys.query_store_plan p ON q.query_id = p.query_id
+    JOIN sys.query_store_runtime_stats rs ON p.plan_id = rs.plan_id
+    WHERE OBJECT_NAME(q.object_id) = @ProcName
+        AND rs.first_execution_time BETWEEN 
+            DATEADD(MINUTE, -@TimeWindow, @ProblemTime) AND 
+            DATEADD(MINUTE, @TimeWindow, @ProblemTime)
+)
+SELECT 
+    event_time,
+    event_type,
+    event_detail,
+    metric_value,
+    DATEDIFF(MINUTE, event_time, @ProblemTime) AS minutes_from_problem,
+    query_plan
+FROM Timeline
+ORDER BY event_time;
+
+
+----# 5. **Top Problem Procedures Dashboard**
+
+
+-- Dashboard view of all problematic procedures
+SELECT TOP 20
+    procedure_name,
+    COUNT(*) AS capture_count,
+    AVG(DATEDIFF(SECOND, start_time, collection_time)) AS avg_duration_sec,
+    MAX(DATEDIFF(SECOND, start_time, collection_time)) AS max_duration_sec,
+    AVG(CAST(reads AS BIGINT)) AS avg_reads,
+    MAX(CAST(reads AS BIGINT)) AS max_reads,
+    COUNT(DISTINCT session_id) AS distinct_sessions,
+    COUNT(DISTINCT CAST(query_plan AS NVARCHAR(MAX))) AS distinct_plans,
+    STRING_AGG(DISTINCT SUBSTRING(wait_info, 1, 50), '; ') AS top_waits,
+    MAX(collection_time) AS last_execution
+FROM dbo.WhoIsActive
+WHERE procedure_name IS NOT NULL
+    AND collection_time >= DATEADD(DAY, -1, GETDATE())
+    AND DATEDIFF(SECOND, start_time, collection_time) > 5  -- Only long-running
+GROUP BY procedure_name
+ORDER BY avg_duration_sec DESC;
+
+
+---
+
+---- Benefits of This Solution
+
+--1. **Automatic procedure name extraction** - No manual parsing needed
+--2. **Indexed for performance** - Fast queries by procedure name
+--3. **Object ID tracking** - Links to system metadata
+--4. **Historical analysis** - Track performance over time
+--5. **Plan comparison** - Identify when plans changed
+--6. **Wait analysis** - See what procedures are waiting on
+
+--This solution gives you immediate answers to "which stored procedure had issues and when did it start?"
